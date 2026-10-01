@@ -5,7 +5,7 @@ from collections import defaultdict,deque
 from typing import Iterable,Mapping
 from .models import TaskSpec,TaskRun,ServiceState,Decision
 from .timeutil import Window,utc
-from .ledger import ReservationLedger,ConflictError,StaleGeneration
+from .ledger import Reservation,ReservationLedger,ConflictError,StaleGeneration
 
 @dataclass(frozen=True)
 class ResourceRequirement:
@@ -34,6 +34,7 @@ class TurnaroundPlanner:
         self.resources={k:tuple(sorted(v)) for k,v in resources.items()}
         self.ledger:ReservationLedger[str]=ReservationLedger()
         self.plans:dict[str,TurnPlan]={}
+        self._reservations:dict[str,tuple[Reservation[str],...]]={}
 
     def _validate_graph(self,tasks:Mapping[str,TurnTask])->tuple[str,...]:
         incoming={tid:set(t.spec.predecessors) for tid,t in tasks.items()}
@@ -130,20 +131,38 @@ class TurnaroundPlanner:
         return TurnPlan(flight_id,anchor,departure,runs,generation,critical,slack)
 
     def commit(self, plan: TurnPlan) -> Decision:
-        if self.ledger.generation != plan.resource_generation:
-            self.plans[plan.flight_id] = plan
-            return Decision(True, "reconciled", "stale plan accepted after generation refresh", {"critical_path": plan.critical_path})
+        existing = self.plans.get(plan.flight_id)
+        if existing is not None:
+            if existing == plan:
+                return Decision(True, "ok", "turnaround plan already committed", {"critical_path": plan.critical_path})
+            return Decision(False, "duplicate-plan", "flight already has a committed turnaround plan; release it before committing a replacement")
+        stale = self.ledger.generation != plan.resource_generation
         staged=[]
         for run in plan.runs.values():
             for rid in run.resources:
                 staged.append((rid,run.planned,f"{plan.flight_id}:{run.task_id}"))
         try:
             if staged:
-                self.ledger.bulk_reserve(staged,self.ledger.generation)
+                reservations=self.ledger.bulk_reserve(staged,self.ledger.generation)
+            else:
+                reservations=()
         except (ConflictError,StaleGeneration) as e:
             return Decision(False,"resource-conflict",str(e))
         self.plans[plan.flight_id]=plan
+        self._reservations[plan.flight_id]=tuple(reservations)
+        if stale:
+            return Decision(True,"reconciled","stale plan revalidated and reserved against current generation",{"critical_path":plan.critical_path})
         return Decision(True,"ok","turnaround plan committed",{"critical_path":plan.critical_path})
+
+    def reservations_for(self, flight_id: str) -> tuple[Reservation[str], ...]:
+        return self._reservations.get(flight_id, ())
+
+    def release(self, flight_id: str) -> tuple[Reservation[str], ...]:
+        self.plans.pop(flight_id, None)
+        released = self._reservations.pop(flight_id, ())
+        for reservation in released:
+            self.ledger.release(reservation.token)
+        return released
 
     def transition(self,flight_id:str,task_id:str,new_state:ServiceState,actual:Window|None=None,blocked_reason:str|None=None)->TaskRun:
         plan=self.plans[flight_id];run=plan.runs[task_id]

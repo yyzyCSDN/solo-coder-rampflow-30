@@ -71,7 +71,7 @@ class StandPlanner:
         after=stand.tow_out_buffer_min if tow_out else 0
         return occupancy.expand(before=before, after=after)
 
-    def _lane_conflict(self, stand: Stand, protected: Window) -> list[str]:
+    def _lane_conflict(self, stand: Stand, protected: Window, ignore_token: int | None = None) -> list[str]:
         if not stand.pushback_lane:
             return []
         hit=[]
@@ -79,11 +79,13 @@ class StandPlanner:
             if sid == stand.stand_id or candidate.pushback_lane != stand.pushback_lane:
                 continue
             for r in self.ledger.reservations(sid):
+                if ignore_token is not None and r.token == ignore_token:
+                    continue
                 if r.payload.protected_window.overlaps(protected):
                     hit.append(sid)
         return hit
 
-    def _adjacency_conflict(self, stand: Stand, aircraft: Aircraft, protected: Window) -> list[str]:
+    def _adjacency_conflict(self, stand: Stand, aircraft: Aircraft, protected: Window, ignore_token: int | None = None) -> list[str]:
         group=stand.adjacency_group
         if not group or group not in self.rules:
             return []
@@ -94,7 +96,7 @@ class StandPlanner:
         for sid,candidate in self.stands.items():
             if sid==stand.stand_id or candidate.adjacency_group != group:
                 continue
-            for r in self.ledger.reservations(sid):
+            for r in self._reservations(sid, ignore_token):
                 if r.payload.protected_window.overlaps(protected):
                     overlapping.append(sid)
                     other_reg=r.payload.aircraft_reg
@@ -108,6 +110,12 @@ class StandPlanner:
             return overlapping or ["combined-wingspan"]
         return []
 
+    def _reservations(self, stand_id: str, ignore_token: int | None = None) -> tuple:
+        rows = self.ledger.reservations(stand_id)
+        if ignore_token is None:
+            return rows
+        return tuple(r for r in rows if r.token != ignore_token)
+
     def _wingspan_for_registration(self, registration: str) -> float:
         for items in self.ledger._by_resource.values():
             for r in items:
@@ -117,7 +125,7 @@ class StandPlanner:
                         return float(metadata)
         return 36.0
 
-    def evaluate(self, flight: Flight, stand_id: str, tow_in: bool = False, tow_out: bool = False) -> Decision:
+    def evaluate(self, flight: Flight, stand_id: str, tow_in: bool = False, tow_out: bool = False, ignore_token: int | None = None) -> Decision:
         if stand_id not in self.stands:
             return Decision(False,"unknown-stand","stand does not exist")
         stand=self.stands[stand_id]
@@ -126,21 +134,22 @@ class StandPlanner:
         if flight.international and not stand.international_capable:
             return Decision(False,"border-control","international flight requires capable stand")
         protected=self._protected(stand,flight.occupancy,tow_in,tow_out)
-        direct=self.ledger.conflicts(stand_id,protected)
+        direct=self._reservations(stand_id,ignore_token)
+        direct=tuple(r for r in direct if r.window.overlaps(protected))
         if direct:
             return Decision(False,"occupied","stand occupancy overlaps protected interval",{"tokens":[r.token for r in direct]})
-        lane=self._lane_conflict(stand,protected)
+        lane=self._lane_conflict(stand,protected,ignore_token)
         if lane:
             return Decision(False,"pushback-lane","shared pushback lane conflict",{"stands":lane})
-        adjacent=self._adjacency_conflict(stand,flight.aircraft,protected)
+        adjacent=self._adjacency_conflict(stand,flight.aircraft,protected,ignore_token)
         if adjacent:
             return Decision(False,"adjacency","adjacent stand safety envelope conflict",{"stands":adjacent})
         return Decision(True,"ok","stand feasible",{"protected_start":protected.start,"protected_end":protected.end})
 
-    def rank(self, flight: Flight, preferred_terminal: str | None = None, tow_in: bool = False, tow_out: bool = False) -> list[StandAssignment]:
+    def rank(self, flight: Flight, preferred_terminal: str | None = None, tow_in: bool = False, tow_out: bool = False, ignore_token: int | None = None) -> list[StandAssignment]:
         out=[]
         for stand in self.stands.values():
-            d=self.evaluate(flight,stand.stand_id,tow_in,tow_out)
+            d=self.evaluate(flight,stand.stand_id,tow_in,tow_out,ignore_token=ignore_token)
             if not d.accepted:
                 continue
             score=100.0
@@ -183,7 +192,7 @@ class StandPlanner:
         use=current.payload
         fake_aircraft=Aircraft(use.aircraft_reg,"UNKNOWN",self._wingspan_for_registration(use.aircraft_reg),20,1,1)
         fake_flight=Flight(use.flight_id,fake_aircraft,"","",use.actual_window.start,use.actual_window.end,0,0,international=use.international)
-        decision=self.evaluate(fake_flight,new_stand_id,use.tow_in,use.tow_out)
+        decision=self.evaluate(fake_flight,new_stand_id,use.tow_in,use.tow_out,ignore_token=token)
         if not decision.accepted:
             raise ConflictError(decision.reason)
         self.ledger.release(token,expected_generation)
@@ -191,7 +200,15 @@ class StandPlanner:
         protected=self._protected(stand,use.actual_window,use.tow_in,use.tow_out)
         moved=StandUse(use.flight_id,use.aircraft_reg,use.actual_window,protected,use.tow_in,use.tow_out,use.international)
         object.__setattr__(moved,"_aircraft_wingspan_m",self._wingspan_for_registration(use.aircraft_reg))
-        return self.ledger.reserve(new_stand_id,protected,moved,self.ledger.generation)
+        try:
+            return self.ledger.reserve(new_stand_id,protected,moved,self.ledger.generation)
+        except Exception:
+            self.ledger.reserve(current.resource_id,current.window,current.payload)
+            raise
+
+    def reservation_for_flight(self, flight_id: str) -> Reservation[StandUse] | None:
+        _, rows = self.ledger.snapshot()
+        return next((r for r in rows if r.payload.flight_id == flight_id), None)
 
     def utilization(self, horizon: Window) -> Mapping[str,float]:
         result={}

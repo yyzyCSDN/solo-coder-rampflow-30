@@ -57,6 +57,57 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(control.stream.head, 0)
 
+    def test_turnaround_stand_commit_publishes_after_success(self):
+        control = RampWorkflowControl()
+        calls = []
+
+        receipt = control.commit_turnaround_stand(
+            "op-s1", "F1", self.at, lambda: calls.append("commit") or "moved",
+        )
+
+        self.assertEqual(calls, ["commit"])
+        self.assertEqual(control.stream.head, 1)
+        self.assertEqual(receipt.result, "moved")
+        self.assertEqual(receipt.event.topic, "turnaround.stand.committed")
+
+    def test_turnaround_stand_commit_failure_publishes_nothing(self):
+        control = RampWorkflowControl()
+
+        def rejected():
+            raise RuntimeError("stand became unavailable")
+
+        with self.assertRaises(RuntimeError):
+            control.commit_turnaround_stand("op-s2", "F1", self.at, rejected)
+        self.assertEqual(control.stream.head, 0)
+        self.assertEqual(control.receipts, {})
+
+    def test_turnaround_stand_commit_requires_dependencies(self):
+        control = RampWorkflowControl()
+        calls = []
+        denied = Decision(False, "stale-generation", "plan built on old resource generation")
+        with self.assertRaises(WorkflowRejected):
+            control.commit_turnaround_stand(
+                "op-s3", "F1", self.at,
+                lambda: calls.append("commit"), requirements=(denied,),
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(control.stream.head, 0)
+
+    def test_turnaround_stand_commit_is_idempotent(self):
+        control = RampWorkflowControl()
+        calls = []
+
+        first = control.commit_turnaround_stand(
+            "op-s4", "F1", self.at, lambda: calls.append("commit") or "ok",
+        )
+        second = control.commit_turnaround_stand(
+            "op-s4", "F1", self.at, lambda: calls.append("duplicate"),
+        )
+
+        self.assertIs(first, second)
+        self.assertEqual(calls, ["commit"])
+        self.assertEqual(control.stream.head, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
