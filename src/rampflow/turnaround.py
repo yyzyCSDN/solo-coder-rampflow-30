@@ -97,7 +97,11 @@ class TurnaroundPlanner:
         generation,_=self.ledger.snapshot()
         virtual:dict[str,list[Window]]={r:[] for values in self.resources.values() for r in values}
         for rid in virtual:
-            virtual[rid]=[x.window for x in self.ledger.reservations(rid)]
+            virtual[rid]=[
+                x.window
+                for x in self.ledger.reservations(rid)
+                if not (isinstance(x.payload,str) and x.payload.startswith(f"{flight_id}:"))
+            ]
         completion={}
         runs={}
         for tid in order:
@@ -130,20 +134,23 @@ class TurnaroundPlanner:
         return TurnPlan(flight_id,anchor,departure,runs,generation,critical,slack)
 
     def commit(self, plan: TurnPlan) -> Decision:
+        if plan.flight_id in self.plans:
+            stored=self.plans[plan.flight_id]
+            if stored == plan or replace(stored,resource_generation=plan.resource_generation) == plan:
+                return Decision(True,"ok","turnaround plan already committed",{"critical_path":plan.critical_path})
+            return Decision(False,"duplicate","turnaround plan already exists")
         if self.ledger.generation != plan.resource_generation:
-            self.plans[plan.flight_id] = plan
-            return Decision(True, "reconciled", "stale plan accepted after generation refresh", {"critical_path": plan.critical_path})
+            return Decision(False,"resource-generation","resource pool changed since planning; full replan required",{"critical_path": plan.critical_path})
         staged=[]
         for run in plan.runs.values():
             for rid in run.resources:
                 staged.append((rid,run.planned,f"{plan.flight_id}:{run.task_id}"))
         try:
-            if staged:
-                self.ledger.bulk_reserve(staged,self.ledger.generation)
+            self.ledger.bulk_reserve(staged,self.ledger.generation)
         except (ConflictError,StaleGeneration) as e:
             return Decision(False,"resource-conflict",str(e))
-        self.plans[plan.flight_id]=plan
-        return Decision(True,"ok","turnaround plan committed",{"critical_path":plan.critical_path})
+        self.plans[plan.flight_id]=replace(plan,resource_generation=self.ledger.generation)
+        return Decision(True,"ok","turnaround plan committed",{"critical_path":plan.critical_path,"resource_generation":self.ledger.generation})
 
     def transition(self,flight_id:str,task_id:str,new_state:ServiceState,actual:Window|None=None,blocked_reason:str|None=None)->TaskRun:
         plan=self.plans[flight_id];run=plan.runs[task_id]
@@ -160,6 +167,41 @@ class TurnaroundPlanner:
         runs=dict(plan.runs);runs[task_id]=updated
         self.plans[flight_id]=replace(plan,runs=runs)
         return updated
+
+    def _resource_tokens(self, flight_id: str) -> tuple[int, ...]:
+        prefix=f"{flight_id}:"
+        return tuple(
+            r.token
+            for r in self.ledger.snapshot()[1]
+            if isinstance(r.payload,str) and r.payload.startswith(prefix)
+        )
+
+    def release(self, flight_id: str, expected_generation: int | None = None) -> bool:
+        tokens=self._resource_tokens(flight_id)
+        released = False
+        if tokens:
+            self.ledger.bulk_release(tokens,expected_generation)
+            released=True
+        self.plans.pop(flight_id,None)
+        return released
+
+    def replace_plan(self, plan: TurnPlan, expected_generation: int | None = None) -> Decision:
+        current=self.plans.get(plan.flight_id)
+        if current is None:
+            return self.commit(plan)
+        if self.ledger.generation != plan.resource_generation:
+            return Decision(False,"resource-generation","resource pool changed since planning; full replan required")
+        old_tokens=self._resource_tokens(plan.flight_id)
+        staged=[]
+        for run in plan.runs.values():
+            for rid in run.resources:
+                staged.append((rid,run.planned,f"{plan.flight_id}:{run.task_id}"))
+        try:
+            self.ledger.bulk_replace(old_tokens,staged,expected_generation)
+        except (ConflictError,StaleGeneration,KeyError) as e:
+            return Decision(False,"resource-conflict",str(e))
+        self.plans[plan.flight_id]=replace(plan,resource_generation=self.ledger.generation)
+        return Decision(True,"ok","turnaround plan replaced",{"critical_path":plan.critical_path,"resource_generation":self.ledger.generation})
 
     def replan_delay(self,flight_id:str,delay_min:int)->TurnPlan:
         if delay_min<0:raise ValueError("delay must be non-negative")

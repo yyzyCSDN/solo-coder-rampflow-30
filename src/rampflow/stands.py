@@ -71,7 +71,7 @@ class StandPlanner:
         after=stand.tow_out_buffer_min if tow_out else 0
         return occupancy.expand(before=before, after=after)
 
-    def _lane_conflict(self, stand: Stand, protected: Window) -> list[str]:
+    def _lane_conflict(self, stand: Stand, protected: Window, ignore_token: int | None = None) -> list[str]:
         if not stand.pushback_lane:
             return []
         hit=[]
@@ -79,11 +79,13 @@ class StandPlanner:
             if sid == stand.stand_id or candidate.pushback_lane != stand.pushback_lane:
                 continue
             for r in self.ledger.reservations(sid):
+                if r.token == ignore_token:
+                    continue
                 if r.payload.protected_window.overlaps(protected):
                     hit.append(sid)
         return hit
 
-    def _adjacency_conflict(self, stand: Stand, aircraft: Aircraft, protected: Window) -> list[str]:
+    def _adjacency_conflict(self, stand: Stand, aircraft: Aircraft, protected: Window, ignore_token: int | None = None) -> list[str]:
         group=stand.adjacency_group
         if not group or group not in self.rules:
             return []
@@ -95,6 +97,8 @@ class StandPlanner:
             if sid==stand.stand_id or candidate.adjacency_group != group:
                 continue
             for r in self.ledger.reservations(sid):
+                if r.token == ignore_token:
+                    continue
                 if r.payload.protected_window.overlaps(protected):
                     overlapping.append(sid)
                     other_reg=r.payload.aircraft_reg
@@ -108,16 +112,52 @@ class StandPlanner:
             return overlapping or ["combined-wingspan"]
         return []
 
-    def _wingspan_for_registration(self, registration: str) -> float:
+    def _reservation_metadata(self, registration: str) -> dict[str, object]:
         for items in self.ledger._by_resource.values():
             for r in items:
                 if r.payload.aircraft_reg == registration:
-                    metadata=getattr(r.payload, "_aircraft_wingspan_m", None)
-                    if metadata is not None:
-                        return float(metadata)
-        return 36.0
+                    return {
+                        "wingspan": getattr(r.payload, "_aircraft_wingspan_m", 36.0),
+                        "length": getattr(r.payload, "_aircraft_length_m", 40.0),
+                        "family": getattr(r.payload, "_aircraft_family", "UNKNOWN"),
+                        "seats": getattr(r.payload, "_aircraft_seats", 180),
+                        "attributes": frozenset(getattr(r.payload, "_aircraft_attributes", ())),
+                    }
+        return {
+            "wingspan":36.0,
+            "length":40.0,
+            "family":"UNKNOWN",
+            "seats":180,
+            "attributes":frozenset(),
+        }
 
-    def evaluate(self, flight: Flight, stand_id: str, tow_in: bool = False, tow_out: bool = False) -> Decision:
+    def _flight_for_use(self, use: StandUse) -> Flight:
+        meta=self._reservation_metadata(use.aircraft_reg)
+        aircraft=Aircraft(
+            use.aircraft_reg,
+            str(meta["family"]),
+            float(meta["wingspan"]),
+            float(meta["length"]),
+            1.0,
+            int(meta["seats"]),
+            attributes=frozenset(meta["attributes"]),
+        )
+        return Flight(
+            use.flight_id,
+            aircraft,
+            "",
+            "",
+            use.actual_window.start,
+            use.actual_window.end,
+            0,
+            0,
+            international=use.international,
+        )
+
+    def _wingspan_for_registration(self, registration: str) -> float:
+        return float(self._reservation_metadata(registration)["wingspan"])
+
+    def evaluate(self, flight: Flight, stand_id: str, tow_in: bool = False, tow_out: bool = False, ignore_token: int | None = None) -> Decision:
         if stand_id not in self.stands:
             return Decision(False,"unknown-stand","stand does not exist")
         stand=self.stands[stand_id]
@@ -126,21 +166,21 @@ class StandPlanner:
         if flight.international and not stand.international_capable:
             return Decision(False,"border-control","international flight requires capable stand")
         protected=self._protected(stand,flight.occupancy,tow_in,tow_out)
-        direct=self.ledger.conflicts(stand_id,protected)
+        direct=tuple(r for r in self.ledger.conflicts(stand_id,protected) if r.token != ignore_token)
         if direct:
             return Decision(False,"occupied","stand occupancy overlaps protected interval",{"tokens":[r.token for r in direct]})
-        lane=self._lane_conflict(stand,protected)
+        lane=self._lane_conflict(stand,protected,ignore_token)
         if lane:
             return Decision(False,"pushback-lane","shared pushback lane conflict",{"stands":lane})
-        adjacent=self._adjacency_conflict(stand,flight.aircraft,protected)
+        adjacent=self._adjacency_conflict(stand,flight.aircraft,protected,ignore_token)
         if adjacent:
             return Decision(False,"adjacency","adjacent stand safety envelope conflict",{"stands":adjacent})
         return Decision(True,"ok","stand feasible",{"protected_start":protected.start,"protected_end":protected.end})
 
-    def rank(self, flight: Flight, preferred_terminal: str | None = None, tow_in: bool = False, tow_out: bool = False) -> list[StandAssignment]:
+    def rank(self, flight: Flight, preferred_terminal: str | None = None, tow_in: bool = False, tow_out: bool = False, ignore_token: int | None = None) -> list[StandAssignment]:
         out=[]
         for stand in self.stands.values():
-            d=self.evaluate(flight,stand.stand_id,tow_in,tow_out)
+            d=self.evaluate(flight,stand.stand_id,tow_in,tow_out,ignore_token)
             if not d.accepted:
                 continue
             score=100.0
@@ -166,12 +206,16 @@ class StandPlanner:
         protected=self._protected(stand,flight.occupancy,tow_in,tow_out)
         use=StandUse(flight.flight_id,flight.aircraft.registration,flight.occupancy,protected,tow_in,tow_out,flight.international)
         object.__setattr__(use,"_aircraft_wingspan_m",flight.aircraft.wingspan_m)
+        object.__setattr__(use,"_aircraft_length_m",flight.aircraft.length_m)
+        object.__setattr__(use,"_aircraft_family",flight.aircraft.family)
+        object.__setattr__(use,"_aircraft_seats",flight.aircraft.seats)
+        object.__setattr__(use,"_aircraft_attributes",tuple(sorted(flight.aircraft.attributes)))
         reservation=self.ledger.reserve(stand_id,protected,use,expected_generation)
         ranked={x.stand_id:x for x in self.rank(flight,None,tow_in,tow_out)}
         base=ranked.get(stand_id,StandAssignment(stand_id,0.0,()))
         return StandAssignment(stand_id,base.score,base.reasons,reservation)
 
-    def move(self, token: int, new_stand_id: str, expected_generation: int) -> Reservation[StandUse]:
+    def move(self, token: int, new_stand_id: str, expected_generation: int, ignore_token: int | None = None) -> Reservation[StandUse]:
         generation, rows=self.ledger.snapshot()
         if generation != expected_generation:
             raise StaleGeneration("stand plan changed")
@@ -181,17 +225,22 @@ class StandPlanner:
         if new_stand_id not in self.stands:
             raise KeyError(new_stand_id)
         use=current.payload
-        fake_aircraft=Aircraft(use.aircraft_reg,"UNKNOWN",self._wingspan_for_registration(use.aircraft_reg),20,1,1)
-        fake_flight=Flight(use.flight_id,fake_aircraft,"","",use.actual_window.start,use.actual_window.end,0,0,international=use.international)
-        decision=self.evaluate(fake_flight,new_stand_id,use.tow_in,use.tow_out)
+        flight=self._flight_for_use(use)
+        decision=self.evaluate(flight,new_stand_id,use.tow_in,use.tow_out,ignore_token or token)
         if not decision.accepted:
             raise ConflictError(decision.reason)
-        self.ledger.release(token,expected_generation)
         stand=self.stands[new_stand_id]
         protected=self._protected(stand,use.actual_window,use.tow_in,use.tow_out)
         moved=StandUse(use.flight_id,use.aircraft_reg,use.actual_window,protected,use.tow_in,use.tow_out,use.international)
-        object.__setattr__(moved,"_aircraft_wingspan_m",self._wingspan_for_registration(use.aircraft_reg))
-        return self.ledger.reserve(new_stand_id,protected,moved,self.ledger.generation)
+        for name,value in (
+            ("_aircraft_wingspan_m",flight.aircraft.wingspan_m),
+            ("_aircraft_length_m",flight.aircraft.length_m),
+            ("_aircraft_family",flight.aircraft.family),
+            ("_aircraft_seats",flight.aircraft.seats),
+            ("_aircraft_attributes",tuple(sorted(flight.aircraft.attributes))),
+        ):
+            object.__setattr__(moved,name,value)
+        return self.ledger.move(token,new_stand_id,protected,moved,expected_generation)
 
     def utilization(self, horizon: Window) -> Mapping[str,float]:
         result={}

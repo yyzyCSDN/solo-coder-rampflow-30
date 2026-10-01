@@ -58,5 +58,17 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertEqual(control.stream.head, 0)
 
 
+    def test_turnaround_stand_event_waits_for_domain_commit(self):
+        control = RampWorkflowControl()
+
+        def rejected():
+            raise RuntimeError("package rejected")
+
+        with self.assertRaises(RuntimeError):
+            control.commit_turnaround_stand("op-5", "F5", self.at, rejected)
+        self.assertEqual(control.stream.head, 0)
+        self.assertEqual(control.receipts, {})
+
+
 if __name__ == "__main__":
     unittest.main()

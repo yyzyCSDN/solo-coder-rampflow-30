@@ -83,7 +83,8 @@ class StandOrchestrator:
 
     def _adjacency_ok(self, stand_id: str, protected: Window, ignore: str | None = None) -> bool:
         profile = self.profiles[stand_id]
-        forbidden = set(profile.incompatible_simultaneous)
+        forbidden = {other_id for other_id, other in self.profiles.items() if stand_id in other.incompatible_simultaneous}
+        forbidden.update(profile.incompatible_simultaneous)
         for other_id in forbidden:
             for assignment in self.by_stand.get(other_id, ()):
                 if assignment.flight_id == ignore:
@@ -100,7 +101,7 @@ class StandOrchestrator:
                 return False
         return self._adjacency_ok(stand_id, protected, ignore)
 
-    def candidates(self, demand: StandDemand) -> tuple[StandAssignment, ...]:
+    def candidates(self, demand: StandDemand, ignore: str | None = None) -> tuple[StandAssignment, ...]:
         protected = self._protected(demand)
         out = []
         preference_rank = {
@@ -109,7 +110,7 @@ class StandOrchestrator:
         for stand_id, p in self.profiles.items():
             if not self._profile_ok(p, demand):
                 continue
-            if not self._stand_free(stand_id, protected):
+            if not self._stand_free(stand_id, protected, ignore):
                 continue
             rank = preference_rank.get(p.terminal, len(preference_rank) + 1)
             bridge_penalty = max(0, p.jetbridge_count - 1)
@@ -126,8 +127,8 @@ class StandOrchestrator:
             )
         return tuple(sorted(out, key=lambda a: a.score))
 
-    def plan(self, demand: StandDemand) -> StandAssignment:
-        options = self.candidates(demand)
+    def plan(self, demand: StandDemand, ignore: str | None = None) -> StandAssignment:
+        options = self.candidates(demand, ignore)
         if not options:
             raise StandConflict(f"no feasible stand for {demand.flight_id}")
         return options[0]
@@ -140,11 +141,42 @@ class StandOrchestrator:
             raise StandConflict("flight already has a stand")
         if assignment.stand_id not in self.profiles:
             raise StandConflict("unknown stand")
+        if assignment.generation != self.generation:
+            raise StandConflict("stand plan is stale")
         if not self._stand_free(assignment.stand_id, assignment.protected_window):
             raise StandConflict("stand became unavailable")
         self.assignments[assignment.flight_id] = assignment
         self.by_stand[assignment.stand_id].append(assignment)
         self.by_stand[assignment.stand_id].sort(
+            key=lambda a: (a.protected_window.start, a.flight_id)
+        )
+        self.generation += 1
+
+    def replace(self, flight_id: str, assignment: StandAssignment) -> None:
+        existing = self.assignments.get(flight_id)
+        if existing is None:
+            self.commit(assignment)
+            return
+        if assignment.flight_id != flight_id:
+            raise StandConflict("assignment belongs to a different flight")
+        if assignment.stand_id not in self.profiles:
+            raise StandConflict("unknown stand")
+        if assignment.generation != self.generation:
+            raise StandConflict("stand plan is stale")
+        if not self._stand_free(
+            assignment.stand_id,
+            assignment.protected_window,
+            ignore=flight_id,
+        ):
+            raise StandConflict("stand became unavailable")
+        old_stand = existing.stand_id
+        self.by_stand[old_stand] = [
+            item for item in self.by_stand[old_stand] if item.flight_id != flight_id
+        ]
+        updated = replace(assignment, generation=self.generation)
+        self.assignments[flight_id] = updated
+        self.by_stand[updated.stand_id].append(updated)
+        self.by_stand[updated.stand_id].sort(
             key=lambda a: (a.protected_window.start, a.flight_id)
         )
         self.generation += 1

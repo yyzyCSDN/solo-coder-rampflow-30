@@ -36,6 +36,19 @@ class ReservationLedger(Generic[T]):
             rows=[x for items in self._by_resource.values() for x in items]
             rows.sort(key=lambda r:(r.resource_id,r.window.start,r.window.end,r.token))
             return self._generation,tuple(rows)
+    def export_state(self)->tuple[dict[str,list[Reservation[T]]],int,int]:
+        with self._lock:
+            return (
+                {rid:list(items) for rid,items in self._by_resource.items()},
+                self._generation,
+                self._next_token,
+            )
+    def restore_state(self,state:tuple[dict[str,list[Reservation[T]]],int,int])->None:
+        rows,generation,next_token=state
+        with self._lock:
+            self._by_resource={rid:list(items) for rid,items in rows.items()}
+            self._generation=generation
+            self._next_token=next_token
     def reservations(self,resource_id:str)->tuple[Reservation[T],...]:
         with self._lock:
             return tuple(self._by_resource.get(resource_id,()))
@@ -92,6 +105,103 @@ class ReservationLedger(Generic[T]):
                     self._generation += 1
                     return True
             return False
+    def bulk_release(self,tokens:Iterable[int],expected_generation:int|None=None)->bool:
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise StaleGeneration("ledger changed")
+            token_list=tuple(tokens)
+            token_set=frozenset(token_list)
+            if len(token_set) != len(token_list):
+                raise ValueError("duplicate release token")
+            found=set()
+            for rid,items in list(self._by_resource.items()):
+                kept=[r for r in items if r.token not in token_set]
+                found.update(r.token for r in items if r.token in token_set)
+                if len(kept)!=len(items):
+                    if kept:
+                        self._by_resource[rid]=kept
+                    else:
+                        del self._by_resource[rid]
+            missing=token_set-found
+            if missing:
+                raise KeyError(next(iter(missing)))
+            if found:
+                self._generation += 1
+                return True
+            return False
+    def move(self,token:int,new_resource_id:str,new_window:Window,payload:T,expected_generation:int|None=None)->Reservation[T]:
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise StaleGeneration("ledger changed")
+            old_resource_id=None
+            old=None
+            for rid,items in self._by_resource.items():
+                for item in items:
+                    if item.token==token:
+                        old_resource_id=rid
+                        old=item
+                        break
+                if old is not None:
+                    break
+            if old is None:
+                raise KeyError(token)
+            conflicts=[
+                r for r in self._by_resource.get(new_resource_id,())
+                if r.token != token and r.window.overlaps(new_window)
+            ]
+            if conflicts:
+                raise ConflictError(f"{new_resource_id} unavailable")
+            old_items=self._by_resource.pop(old_resource_id)
+            old_items=[r for r in old_items if r.token != token]
+            if old_items:
+                self._by_resource[old_resource_id]=old_items
+            updated=Reservation(token,new_resource_id,new_window,payload,self._generation+1)
+            self._by_resource.setdefault(new_resource_id,[]).append(updated)
+            self._by_resource[new_resource_id].sort(key=lambda r:(r.window.start,r.window.end,r.token))
+            self._generation += 1
+            return updated
+    def bulk_replace(self,tokens:Iterable[int],requests:Iterable[tuple[str,Window,T]],expected_generation:int|None=None)->tuple[Reservation[T],...]:
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                raise StaleGeneration("ledger changed")
+            token_list=tuple(tokens)
+            token_set=frozenset(token_list)
+            if len(token_list) != len(token_set):
+                raise ValueError("duplicate replacement token")
+            old_by_token={}
+            for items in self._by_resource.values():
+                for item in items:
+                    if item.token in token_set:
+                        old_by_token[item.token]=item
+            missing=token_set-old_by_token.keys()
+            if missing:
+                raise KeyError(next(iter(missing)))
+            req=list(requests)
+            shadow={
+                rid:[r for r in items if r.token not in token_set]
+                for rid,items in self._by_resource.items()
+            }
+            for rid,window,_ in req:
+                if any(r.window.overlaps(window) for r in shadow.get(rid,())):
+                    raise ConflictError(f"{rid} unavailable")
+                placeholder=Reservation(-1,rid,window,None,self._generation)  # type: ignore[arg-type]
+                shadow.setdefault(rid,[]).append(placeholder)
+            for old in old_by_token.values():
+                items=self._by_resource.get(old.resource_id,())
+                kept=[r for r in items if r.token != old.token]
+                if kept:
+                    self._by_resource[old.resource_id]=kept
+                elif old.resource_id in self._by_resource:
+                    del self._by_resource[old.resource_id]
+            out=[]
+            for rid,window,payload in req:
+                item=Reservation(self._next_token,rid,window,payload,self._generation+1)
+                self._next_token += 1
+                self._generation += 1
+                self._by_resource.setdefault(rid,[]).append(item)
+                self._by_resource[rid].sort(key=lambda r:(r.window.start,r.window.end,r.token))
+                out.append(item)
+            return tuple(out)
     def bulk_reserve(self,requests:Iterable[tuple[str,Window,T]],expected_generation:int|None=None)->tuple[Reservation[T],...]:
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
